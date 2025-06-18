@@ -1,61 +1,103 @@
-import http from 'http'; 
+import https from 'https';
+import http from 'http';
 import { getFromCache, setToCache } from './cache';
-import axios, { AxiosHeaderValue } from 'axios';
+import axios from 'axios';
 
-function convertAxiosHeadersToNode(headers: Record<string, AxiosHeaderValue>): http.OutgoingHttpHeaders {
+function convertHeaders(headers: any): http.OutgoingHttpHeaders {
     const result: http.OutgoingHttpHeaders = {};
     for (const [key, value] of Object.entries(headers)) {
         if (value !== null && value !== undefined) {
-            result[key] = value.toString();
+            result[key] = Array.isArray(value) ? value : value.toString();
         }
     }
-
     return result;
 }
 
 export function startProxyServer(port: number, origin: string) {
+    // Validate and normalize origin URL
+    let normalizedOrigin = origin;
+    
+    // Ensure protocol exists
+    if (!normalizedOrigin.startsWith('http')) {
+        normalizedOrigin = `https://${normalizedOrigin}`;
+    }
+    
+    // Remove trailing slash
+    normalizedOrigin = normalizedOrigin.replace(/\/$/, '');
+    
+    // Verify the origin URL is correct
+    console.log(`Configured origin: ${normalizedOrigin}`);
+
     const server = http.createServer(async (req, res) => {
-        if (!req.url) return;
+        if (!req.url) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'URL is required' }));
+        }
 
         const cacheKey = req.method + ':' + req.url;
-
         const cachedResponse = getFromCache(cacheKey);
-        if(cachedResponse) {
+
+        if (cachedResponse) {
             res.writeHead(200, {
-                'content-type': 'application/json',
-                'X-Cache': 'HIT', 
-                ...cachedResponse.headers, 
+                'Content-Type': 'application/json',
+                'X-Cache': 'HIT',
+                ...convertHeaders(cachedResponse.headers),
             });
-            res.end(cachedResponse.body);
-            return;
+            return res.end(cachedResponse.body);
         }
 
         try {
-            const response = await axios.get(`${origin}${req.url}`, {
-                headers: req.headers,
+            // Construct target URL
+            const targetUrl = new URL(req.url, normalizedOrigin).toString();
+            console.log(`Proxying to: ${targetUrl}`);
+
+            const response = await axios.get(targetUrl, {
+                headers: {
+                    ...req.headers,
+                    host: new URL(normalizedOrigin).hostname,
+                    accept: 'application/json',
+                    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/91.0.4472.124 Safari/537.36'
+                },
+                
+                httpsAgent: new https.Agent({ 
+                    rejectUnauthorized: false 
+                }),
+                validateStatus: () => true
             });
 
-            const data = JSON.stringify(response.data); 
+            console.log(`Response from origin: ${response.status}`);
 
-            setToCache(cacheKey, {
-                body: data,
-                headers: response.headers
-            });
+            const responseData = JSON.stringify(response.data);
+            const responseHeaders = convertHeaders(response.headers);
 
-            res.writeHead(200, {
+            if (response.status === 200) {
+                setToCache(cacheKey, {
+                    body: responseData,
+                    headers: responseHeaders
+                });
+            }
+
+            res.writeHead(response.status, {
                 'Content-Type': 'application/json',
-                'X-Cache': "MISS", 
-                ...convertAxiosHeadersToNode(cachedResponse.headers),
+                'X-Cache': 'MISS',
+                ...responseHeaders
             });
-            res.end(data);
+            return res.end(responseData);
+
         } catch (error: any) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Error fetching from origin', details: error.message}))
+            console.error('Proxy error:', error.message);
+            const status = error.response?.status || 500;
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({
+                error: 'Proxy error',
+                details: error.message,
+                ...(error.response?.data && { originError: error.response.data })
+            }));
         }
     });
 
     server.listen(port, () => {
-        console.log(`Caching proxy started at http://localhost:${port} forwarding to ${origin}`); // log server info
-        
-    })
+        console.log(`\nProxy server running on http://localhost:${port}`);
+        console.log(`Forwarding requests to: ${normalizedOrigin}\n`);
+    });
 }
